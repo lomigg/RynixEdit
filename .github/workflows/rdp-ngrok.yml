@@ -3,14 +3,21 @@
 # Windows RDP machine with /rdp create. The workflow:
 #   1. enables Remote Desktop on the runner,
 #   2. creates a local administrator with a random password,
-#   3. opens a Cloudflare quick tunnel (trycloudflare.com — no account, no
-#      secret needed) to port 3389,
-#   4. publishes Address/Username/Password as the rdp-info-<run_id> artifact
-#      (the Discord bot reads this artifact and DMs it to the requester),
+#   3. opens a free pinggy.io TCP tunnel to port 3389 in the FINAL step
+#      (GitHub's Windows runner kills step-spawned background processes
+#      when the step ends, so the tunnel must own the last step),
+#   4. uploads Address/Username/Password as the rdp-creds-<run_id> /
+#      rdp-info-<run_id> artifacts (readable while the run is in progress)
+#      and optionally POSTs the address to the notify_url webhook input,
 #   5. keeps the machine alive until the run is cancelled or GitHub's
 #      6-hour hosted-runner cap ends the job.
-#   Client side: run "cloudflared access tcp --hostname <address> --url
-#   localhost:13389" then RDP to localhost:13389 (cloudflared.exe is free).
+#
+# NOTE: pinggy free tunnels expire after 60 minutes — create a new machine
+# with /rdp create when that happens. No repository secrets are required.
+#
+# WARNING: GitHub Actions terms only cover project build/test workloads.
+# Using hosted runners as personal remote desktops can get the account
+# suspended — use your own token, at your own risk.
 
 name: Windows RDP Machine
 
@@ -22,13 +29,12 @@ on:
         required: false
         default: "rdpadmin"
       notify_url:
-        description: "Optional webhook URL to POST the tunnel hostname to"
+        description: "Optional webhook URL to POST the tunnel address to"
         required: false
         default: ""
 
 permissions:
   contents: read
-  statuses: write
 
 jobs:
   rdp:
@@ -98,7 +104,7 @@ jobs:
           net localgroup Administrators $username /add
           net localgroup 'Remote Desktop Users' $username /add
 
-          # Hand the credentials to the artifact step; never echo them here.
+          # Hand the credentials to the artifact steps; never echo them here.
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_USERNAME=$username"
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
           Write-Host "User $username created (password withheld from logs)."
@@ -115,7 +121,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Start tunnel, publish info, keep alive
+      - name: Start pinggy tunnel, publish info, keep alive
         shell: pwsh
         env:
           NOTIFY_URL: ${{ inputs.notify_url }}
@@ -124,66 +130,47 @@ jobs:
           # runner kills step-spawned background processes when the step
           # ends, so a tunnel started in an earlier step is dead by the
           # time anyone tries to connect.
-          $cf = Join-Path $env:RUNNER_TEMP 'cloudflared.exe'
-          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cf
-          $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
-          $proc = Start-Process -FilePath $cf `
-            -ArgumentList 'tunnel', '--url', 'tcp://127.0.0.1:3389', "--logfile=$cfLog", '--metrics', '127.0.0.1:36500' `
-            -WindowStyle Hidden -PassThru
+          $ssh = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
+          $pinggyLog = Join-Path $env:RUNNER_TEMP 'pinggy.log'
+          $cmd = "`"$ssh`" -o StrictHostKeyChecking=no -p 443 -R0:localhost:3389 tcp@free.pinggy.io > `"$pinggyLog`" 2>&1"
+          $proc = Start-Process -FilePath "$env:WINDIR\System32\cmd.exe" `
+            -ArgumentList '/c', $cmd -WindowStyle Hidden -PassThru
 
-          $hostname = $null
+          $address = $null
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
             if ($proc.HasExited) { break }
-            if (Test-Path $cfLog) {
-              $match = Select-String -Path $cfLog -Pattern 'https://([a-z0-9-]+\.trycloudflare\.com)' |
+            if (Test-Path $pinggyLog) {
+              $match = Select-String -Path $pinggyLog -Pattern 'tcp://([a-z0-9.-]+):(\d+)' |
                 Select-Object -First 1
-              if ($match) { $hostname = $match.Matches[0].Groups[1].Value; break }
+              if ($match) {
+                $address = $match.Matches[0].Groups[1].Value + ':' + $match.Matches[0].Groups[2].Value
+                break
+              }
             }
           }
-          if (-not $hostname) {
-            Write-Host "=== cloudflared log (last 40 lines) ==="
-            if (Test-Path $cfLog) {
-              Get-Content $cfLog -Tail 40 | ForEach-Object { Write-Host $_ }
+          if (-not $address) {
+            Write-Host "=== pinggy log ==="
+            if (Test-Path $pinggyLog) {
+              Get-Content $pinggyLog | ForEach-Object { Write-Host $_ }
             }
-            Write-Host "::error::Could not obtain the quick-tunnel hostname."
+            Write-Host "::error::Could not obtain the pinggy tunnel address."
             exit 1
           }
 
           Set-Content -Path 'rdp-info.txt' -Value @(
-            "Address:  $hostname",
-            "Tunnel:   cloudflare-quick (client: cloudflared access tcp)",
+            "Address:  $address",
+            "Tunnel:   pinggy-free (direct TCP, no client needed; 60 min limit)",
             "Username: $env:RDP_USERNAME",
             "Password: $env:RDP_PASSWORD"
           )
 
-          # Publish the hostname as a commit status so the bot (and anyone
-          # with API access) can read it while this run is still in progress.
-          $headers = @{
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            Accept        = 'application/vnd.github+json'
-            'User-Agent'  = 'rdp-machine'
-          }
-          $body = @{
-            state       = 'success'
-            context     = 'rdp-machine'
-            description = "Tunnel: $hostname | User: $env:RDP_USERNAME"
-          } | ConvertTo-Json
-          try {
-            Invoke-RestMethod `
-              -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" `
-              -Method Post -Headers $headers -Body $body -ContentType 'application/json' | Out-Null
-            Write-Host "Commit status published."
-          } catch {
-            Write-Host "::warning::Could not publish the commit status: $_"
-          }
-
-          # Fallback channel that needs no GitHub permissions at all: POST the
-          # hostname to the caller-provided webhook (no secrets in the body).
+          # Channel that needs no GitHub permissions: POST the address to the
+          # caller-provided webhook (no secrets in the body).
           if ($env:NOTIFY_URL) {
             try {
               Invoke-RestMethod -Method Post -Uri $env:NOTIFY_URL -ContentType 'text/plain' `
-                -Body "rdp-machine`nhost=$hostname`nuser=$env:RDP_USERNAME" | Out-Null
+                -Body "rdp-machine`nhost=$address`nuser=$env:RDP_USERNAME" | Out-Null
               Write-Host "Notify webhook called."
             } catch {
               Write-Host "::warning::Notify webhook failed: $_"
@@ -192,57 +179,18 @@ jobs:
 
           Write-Host ""
           Write-Host "================ RDP CONNECTION INFO ================"
-          Write-Host "TUNNEL_HOSTNAME=$hostname"
+          Write-Host "TUNNEL_ADDRESS=$address"
           Write-Host "RDP_USER=$env:RDP_USERNAME"
           Write-Host "====================================================="
-          Write-Host "Tunnel ready: $hostname — holding the session."
-          $selfTestDone = $false
+          Write-Host "Tunnel ready: $address — holding the session."
           while ($true) {
             Start-Sleep -Seconds 60
             if ($env:NOTIFY_URL) {
               $probe = @()
               $probe += "heartbeat=$(Get-Date -Format o)"
-              $probe += "cloudflared_alive=$(-not $proc.HasExited)"
+              $probe += "pinggy_alive=$(-not $proc.HasExited)"
               $r = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
               $probe += "rdp_listener=$($r.TcpTestSucceeded)"
-              if (-not $selfTestDone -and $hostname) {
-                # Decisive self-test: loop through the edge from this same
-                # runner (client -> edge -> replica -> origin 3389).
-                try {
-                  $accessProc = Start-Process -FilePath $cf `
-                  -ArgumentList 'access', 'tcp', '--hostname', $hostname, '--url', 'localhost:13400', '--logfile', (Join-Path $env:RUNNER_TEMP 'selftest-access.log') `
-                  -WindowStyle Hidden -PassThru
-                Start-Sleep -Seconds 10
-                try {
-                  $tcp = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 13400)
-                  $stream = $tcp.GetStream()
-                  $cr = New-Object System.Collections.Generic.List[byte]
-                  $cr.AddRange([byte[]](3,0,0,43,42,224,0,0,0,0,0))
-                  $cr.AddRange([System.Text.Encoding]::ASCII.GetBytes("Cookie: mstshash=selftest`r`n"))
-                  $cr.AddRange([byte[]](1,0,8,0,0,0,0,0))
-                  $stream.Write($cr.ToArray(), 0, $cr.Count)
-                  $stream.ReadTimeout = 15000
-                  $buf = New-Object byte[] 64
-                  try {
-                    $n = $stream.Read($buf, 0, 64)
-                    $probe += "selftest=RECV $n bytes: $([BitConverter]::ToString($buf, 0, [Math]::Min($n, 20)))"
-                  } catch {
-                    $probe += "selftest=READ_FAIL $($_.Exception.Message)"
-                  }
-                  $tcp.Close()
-                } catch {
-                  $probe += "selftest=CONNECT_FAIL $($_.Exception.Message)"
-                }
-                try { $accessProc.Kill() } catch { }
-                $selfTestDone = $true
-              }
-              try {
-                $ready = Invoke-WebRequest -Uri 'http://127.0.0.1:36500/ready' -UseBasicParsing -TimeoutSec 5
-                $probe += "edge_ready=$($ready.StatusCode) $($ready.Content)"
-              } catch {
-                $probe += "edge_ready=FAIL $($_.Exception.Message)"
-              }
-              if (Test-Path $cfLog) { $probe += (Get-Content $cfLog -Tail 25) }
               try {
                 Invoke-RestMethod -Method Post -Uri $env:NOTIFY_URL -ContentType 'text/plain' `
                   -Body ($probe -join "`n") | Out-Null
