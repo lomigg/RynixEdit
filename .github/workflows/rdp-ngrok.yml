@@ -21,6 +21,10 @@ on:
         description: "Windows username for the RDP session"
         required: false
         default: "rdpadmin"
+      notify_url:
+        description: "Optional webhook URL to POST the tunnel hostname to"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -113,6 +117,8 @@ jobs:
 
       - name: Start tunnel, publish info, keep alive
         shell: pwsh
+        env:
+          NOTIFY_URL: ${{ inputs.notify_url }}
         run: |
           # The tunnel MUST live inside this final step: GitHub's Windows
           # runner kills step-spawned background processes when the step
@@ -170,6 +176,18 @@ jobs:
             Write-Host "Commit status published."
           } catch {
             Write-Host "::warning::Could not publish the commit status: $_"
+          }
+
+          # Fallback channel that needs no GitHub permissions at all: POST the
+          # hostname to the caller-provided webhook (no secrets in the body).
+          if ($env:NOTIFY_URL) {
+            try {
+              Invoke-RestMethod -Method Post -Uri $env:NOTIFY_URL -ContentType 'text/plain' `
+                -Body "rdp-machine`nhost=$hostname`nuser=$env:RDP_USERNAME" | Out-Null
+              Write-Host "Notify webhook called."
+            } catch {
+              Write-Host "::warning::Notify webhook failed: $_"
+            }
           }
 
           Write-Host ""
