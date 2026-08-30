@@ -1,0 +1,137 @@
+# Template: copy this file into the target repository as
+# .github/workflows/rdp.yml so the Discord bot can create a temporary
+# Windows RDP machine with /rdp create. The workflow:
+#   1. enables Remote Desktop on the runner,
+#   2. creates a local administrator with a random password,
+#   3. opens an ngrok TCP tunnel to port 3389,
+#   4. publishes Address/Username/Password as the rdp-info-<run_id> artifact
+#      (the Discord bot reads this artifact and DMs it to the requester),
+#   5. keeps the machine alive until the run is cancelled or GitHub's
+#      6-hour hosted-runner cap ends the job.
+#
+# Required repository secret: NGROK_AUTHTOKEN (https://dashboard.ngrok.com
+# -> Your Authtoken), added under Settings > Secrets and variables > Actions.
+#
+# WARNING: GitHub Actions terms only cover project build/test workloads.
+# Using hosted runners as personal remote desktops can get the account
+# suspended — use your own token, at your own risk.
+
+name: Windows RDP Machine
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "Windows username for the RDP session"
+        required: false
+        default: "runneradmin"
+
+permissions:
+  contents: read
+
+jobs:
+  rdp:
+    name: Windows RDP machine
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Check ngrok authtoken secret
+        shell: pwsh
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+            Write-Host "::error::Secret NGROK_AUTHTOKEN is missing. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          }
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Write-Host "Remote Desktop enabled (firewall open, NLA off)."
+
+      - name: Create RDP user with random password
+        shell: pwsh
+        env:
+          RDP_USERNAME_INPUT: ${{ inputs.username }}
+        run: |
+          $username = if ($env:RDP_USERNAME_INPUT) { $env:RDP_USERNAME_INPUT } else { 'runneradmin' }
+
+          # 16 chars from an unambiguous alphabet — satisfies Windows password
+          # complexity rules and avoids look-alikes (l/I/1, O/0).
+          $alphabet = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789'
+          $bytes = New-Object byte[] 16
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $rng.GetBytes($bytes)
+          $password = -join ($bytes | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
+
+          net user $username $password /add /y
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Failed to create the Windows user."
+            exit 1
+          }
+          net localgroup Administrators $username /add
+          net localgroup 'Remote Desktop Users' $username /add
+
+          # Hand the credentials to the artifact step; never echo them here.
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_USERNAME=$username"
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
+          Write-Host "User $username created (password withheld from logs)."
+
+      - name: Start ngrok TCP tunnel
+        shell: pwsh
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ngrok.zip'
+          Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ngrok') -Force
+          $ngrok = Join-Path (Join-Path $env:RUNNER_TEMP 'ngrok') 'ngrok.exe'
+          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN | Out-Null
+          Start-Process -FilePath $ngrok -ArgumentList 'tcp', '3389' -WindowStyle Hidden
+          Write-Host "ngrok TCP tunnel to port 3389 started."
+
+      - name: Publish connection info
+        shell: pwsh
+        run: |
+          $address = $null
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $tunnels = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 5
+              $tunnel = $tunnels.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
+              if ($tunnel) {
+                $address = $tunnel.public_url -replace '^tcp://', ''
+                break
+              }
+            } catch { }
+          }
+          if (-not $address) {
+            Write-Host "::error::Could not read the ngrok tunnel address."
+            exit 1
+          }
+
+          Write-Host "Tunnel ready: $address"
+          Set-Content -Path 'rdp-info.txt' -Value @(
+            "Address:  $address",
+            "Username: $env:RDP_USERNAME",
+            "Password: $env:RDP_PASSWORD"
+          )
+
+      - name: Upload connection info artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-info-${{ github.run_id }}
+          path: rdp-info.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Keep the machine alive
+        shell: pwsh
+        run: |
+          Write-Host "RDP machine ready — it lives until the run is cancelled or the 6-hour hosted-runner cap is hit."
+          while ($true) { Start-Sleep -Seconds 300 }
