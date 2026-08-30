@@ -130,30 +130,42 @@ jobs:
           # runner kills step-spawned background processes when the step
           # ends, so a tunnel started in an earlier step is dead by the
           # time anyone tries to connect.
-          $ssh = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
-          $pinggyLog = Join-Path $env:RUNNER_TEMP 'pinggy.log'
-          $cmd = "`"$ssh`" -o StrictHostKeyChecking=no -p 443 -R0:localhost:3389 tcp@free.pinggy.io > `"$pinggyLog`" 2>&1"
-          $proc = Start-Process -FilePath "$env:WINDIR\System32\cmd.exe" `
-            -ArgumentList '/c', $cmd -WindowStyle Hidden -PassThru
+          $sshExe = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
+          if (-not (Test-Path $sshExe)) {
+            $sshExe = Join-Path $env:ProgramFiles 'Git\usr\bin\ssh.exe'
+          }
+          if (-not (Test-Path $sshExe)) {
+            Write-Host "::error::ssh.exe not found on the runner."
+            exit 1
+          }
+          $pinggyOut = Join-Path $env:RUNNER_TEMP 'pinggy.out'
+          $pinggyErr = Join-Path $env:RUNNER_TEMP 'pinggy.err'
+          $proc = Start-Process -FilePath $sshExe `
+            -ArgumentList '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=30', `
+              '-p', '443', '-R0:localhost:3389', 'tcp@free.pinggy.io' `
+            -RedirectStandardOutput $pinggyOut -RedirectStandardError $pinggyErr `
+            -WindowStyle Hidden -PassThru
 
           $address = $null
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
             if ($proc.HasExited) { break }
-            if (Test-Path $pinggyLog) {
-              $match = Select-String -Path $pinggyLog -Pattern 'tcp://([a-z0-9.-]+):(\d+)' |
-                Select-Object -First 1
-              if ($match) {
-                $address = $match.Matches[0].Groups[1].Value + ':' + $match.Matches[0].Groups[2].Value
-                break
+            foreach ($logFile in @($pinggyOut, $pinggyErr)) {
+              if ((Test-Path $logFile) -and -not $address) {
+                $match = Select-String -Path $logFile -Pattern 'tcp://([a-z0-9.-]+):(\d+)' |
+                  Select-Object -First 1
+                if ($match) {
+                  $address = $match.Matches[0].Groups[1].Value + ':' + $match.Matches[0].Groups[2].Value
+                }
               }
             }
+            if ($address) { break }
           }
           if (-not $address) {
-            Write-Host "=== pinggy log ==="
-            if (Test-Path $pinggyLog) {
-              Get-Content $pinggyLog | ForEach-Object { Write-Host $_ }
-            }
+            Write-Host "=== pinggy stdout ==="
+            if (Test-Path $pinggyOut) { Get-Content $pinggyOut | ForEach-Object { Write-Host $_ } }
+            Write-Host "=== pinggy stderr ==="
+            if (Test-Path $pinggyErr) { Get-Content $pinggyErr | ForEach-Object { Write-Host $_ } }
             Write-Host "::error::Could not obtain the pinggy tunnel address."
             exit 1
           }
