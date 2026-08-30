@@ -1,6 +1,7 @@
 # Template: copy this file into the target repository as
 # .github/workflows/rdp-machine.yml so the Discord bot can spawn a temporary
-# RDP machine with /rdp.
+# RDP machine with /rdp. The machine joins your Tailscale tailnet — connect
+# from any device logged in to the SAME tailnet via mstsc to the 100.x.x.x IP.
 #
 # ⚠️ IMPORTANT — read before using:
 #   * Using GitHub-hosted runners as remote desktops violates the GitHub
@@ -11,7 +12,10 @@
 #     A 6-hour session consumes ~720 billed minutes.
 #   * The machine exists only while the workflow runs (hard cap 6 hours).
 #
-# Required repository secret: NGROK_AUTHTOKEN (https://dashboard.ngrok.com)
+# Required repository secret (either spelling is accepted):
+#   TAILSCALE_AUTH_KEY / TALESCALE_AUTH_KEY
+#   A Tailscale auth key (reusable or ephemeral) from
+#   https://login.tailscale.com/admin/settings/keys
 
 name: RDP Machine
 
@@ -69,12 +73,12 @@ jobs:
           }
           $password = -join $chars
 
-          # --- enable Remote Desktop -----------------------------------
+          # --- enable Remote Desktop (NLA stays ON) ---------------------
           Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
             -Name fDenyTSConnections -Value 0
           Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name UserAuthentication -Value 1
-          try { Start-Service TermService -ErrorAction SilentlyContinue } catch {}
+          try { Restart-Service TermService -Force -ErrorAction SilentlyContinue } catch {}
           netsh advfirewall firewall set rule group="remote desktop" new enable=Yes | Out-Null
 
           # --- create the account --------------------------------------
@@ -85,34 +89,50 @@ jobs:
             net localgroup Administrators $username /add | Out-Null
           }
 
-          # Persist the credentials for the next step (never echoed to the log).
+          # Persist the credentials for later steps (never echoed to the log).
           "RDP_USERNAME=$username"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "RDP_PASSWORD=$password"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Created RDP user '$username' (password hidden). RDP enabled."
 
-      - name: Start the ngrok TCP tunnel
+      - name: Install Tailscale
         shell: pwsh
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
-            Write-Host "::error::Repository secret NGROK_AUTHTOKEN is not set. Add it in Settings > Secrets and variables > Actions."
+          $msi = "$env:RUNNER_TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi' `
+            -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/quiet', '/norestart' -Wait
+          Remove-Item $msi -Force
+          Write-Host "Tailscale installed."
+
+      - name: Join the tailnet
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY || secrets.TALESCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            Write-Host "::error::Repository secret TAILSCALE_AUTH_KEY is not set. Create an auth key at https://login.tailscale.com/admin/settings/keys and add it as a repository secret."
             exit 1
           }
-          Invoke-WebRequest `
-            -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' `
-            -OutFile "$env:RUNNER_TEMP\ngrok.zip"
-          Expand-Archive -Path "$env:RUNNER_TEMP\ngrok.zip" `
-            -DestinationPath "$env:RUNNER_TEMP\ngrok" -Force
-          & "$env:RUNNER_TEMP\ngrok\ngrok.exe" config add-authtoken $env:NGROK_AUTHTOKEN | Out-Null
-          # Log to stdout (captured to files) so failures are diagnosable.
-          Start-Process -FilePath "$env:RUNNER_TEMP\ngrok\ngrok.exe" `
-            -ArgumentList 'tcp', '3389', '--log', 'stdout', '--log-format', 'logfmt' `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput "$env:RUNNER_TEMP\ngrok.log" `
-            -RedirectStandardError "$env:RUNNER_TEMP\ngrok.err"
-          Write-Host "ngrok tunnel to localhost:3389 started."
+          & $ts up "--authkey=$env:TS_AUTHKEY" --hostname="gh-rdp-$env:GITHUB_RUN_ID" --accept-dns=false
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::tailscale up failed (auth key invalid, expired or exhausted?)."
+            exit $LASTEXITCODE
+          }
+          $ip = $null
+          for ($i = 0; $i -lt 24; $i++) {
+            $ip = (& $ts ip -4 | Select-Object -First 1)
+            if ($ip) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $ip) {
+            Write-Host "::error::Tailscale IP not assigned."
+            exit 1
+          }
+          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale IP: $ip"
 
       - name: Publish connection info as an artifact
         shell: pwsh
@@ -121,41 +141,24 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Wait until the ngrok local API reports the public tcp endpoint.
-          $endpoint = $null
-          for ($i = 0; $i -lt 45; $i++) {
-            Start-Sleep -Seconds 2
-            try {
-              $tunnels = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 5
-              $tunnel = @($tunnels.tunnels | Where-Object {
-                ($_.'public_url' -like 'tcp://*') })[0]
-              if ($tunnel) { $endpoint = $tunnel.'public_url'; break }
-            } catch {}
-          }
-          if (-not $endpoint) {
-            # Surface ngrok's own log so the real cause (bad authtoken,
-            # account limits, ...) is visible in the job log.
-            foreach ($logFile in @("$env:RUNNER_TEMP\ngrok.log", "$env:RUNNER_TEMP\ngrok.err")) {
-              if (Test-Path $logFile) {
-                Write-Host "--- ngrok log: $logFile (last 40 lines) ---"
-                Get-Content $logFile -Tail 40 | ForEach-Object { Write-Host $_ }
-              }
-            }
-            Write-Host "::error::ngrok tunnel did not come up in time."
+          # Self-check: is the RDP listener actually up?
+          $listener = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 `
+            -WarningAction SilentlyContinue
+          if (-not $listener.TcpTestSucceeded) {
+            Write-Host "::error::Nothing listening on RDP port 3389."
             exit 1
           }
 
-          $parsed = [Uri]$endpoint
           $lines = @(
-            "host=$($parsed.Host)",
-            "port=$($parsed.Port)",
+            "host=$env:TAILSCALE_IP",
+            "port=3389",
             "username=$env:RDP_USERNAME",
             "password=$env:RDP_PASSWORD",
             "ttl_minutes=$env:TTL_MINUTES",
             "machine=$env:COMPUTERNAME"
           )
           $lines | Set-Content -Path connection.txt -Encoding ascii
-          Write-Host "RDP ready: $($parsed.Host):$($parsed.Port) (user $env:RDP_USERNAME)."
+          Write-Host "RDP ready: $env:TAILSCALE_IP:3389 (user $env:RDP_USERNAME)."
 
       - name: Upload connection artifact
         if: always()
