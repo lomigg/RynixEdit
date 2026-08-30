@@ -1,0 +1,62 @@
+# Template: copy this file into the target repository as
+# .github/workflows/windows-test.yml so the Discord bot can trigger it with
+# workflow_dispatch. It runs safe, read-only Windows CI checks on
+# windows-latest and uploads the collected report as an artifact.
+
+name: Windows CI Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-test:
+    name: Windows system checks
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Show runner identity
+        shell: pwsh
+        run: |
+          Write-Host "COMPUTERNAME: $env:COMPUTERNAME"
+          Write-Host "Started at:   $(Get-Date -Format o)"
+
+      - name: Collect Windows system information
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cs = Get-CimInstance Win32_ComputerSystem
+
+          $report = [PSCustomObject]@{
+            ComputerName      = $env:COMPUTERNAME
+            OperatingSystem   = $os.Caption
+            OsVersion         = $os.Version
+            OsBuildNumber     = $os.BuildNumber
+            OsArchitecture    = $os.OSArchitecture
+            Manufacturer      = $cs.Manufacturer
+            Model             = $cs.Model
+            LogicalProcessors = $cs.NumberOfLogicalProcessors
+            TotalMemoryGB     = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+            FreeDiskGB        = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+          }
+
+          $report | Format-List | Tee-Object -FilePath system-info.txt
+
+      - name: Tooling sanity checks
+        shell: pwsh
+        run: |
+          Write-Host "PowerShell $($PSVersionTable.PSVersion)"
+          python --version
+          git --version
+
+      - name: Upload system report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-system-report-${{ github.run_id }}
+          path: system-info.txt
+          if-no-files-found: error
+          retention-days: 7
