@@ -77,9 +77,8 @@ jobs:
           $chars += (Get-RandomString -Pool 'abcdefghijkmnpqrstuvwxyz' -Length 10).ToCharArray()
           $chars += (Get-RandomString -Pool '23456789'                 -Length 3).ToCharArray()
           $chars += (Get-RandomString -Pool '!#$%*+-.?@^~'             -Length 1).ToCharArray()
-          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
           for ($i = $chars.Length - 1; $i -gt 0; $i--) {
-            $j = $rng.Next($i + 1)
+            $j = Get-Random -Maximum ($i + 1)
             $chars[$i], $chars[$j] = $chars[$j], $chars[$i]
           }
           $password = -join $chars
