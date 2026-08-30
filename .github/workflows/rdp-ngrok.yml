@@ -93,7 +93,7 @@ jobs:
           Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cf
           $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
           Start-Process -FilePath $cf `
-            -ArgumentList 'tunnel', '--url', 'tcp://localhost:3389', "--log=$cfLog" `
+            -ArgumentList 'tunnel', '--url', 'tcp://localhost:3389', "--logfile=$cfLog" `
             -WindowStyle Hidden
           Write-Host "cloudflared quick tunnel started (log: $cfLog)."
 
