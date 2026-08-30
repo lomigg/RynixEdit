@@ -1,0 +1,170 @@
+# Template: copy this file into the target repository as
+# .github/workflows/rdp-machine.yml so the Discord bot can spawn a temporary
+# RDP machine with /rdp.
+#
+# ⚠️ IMPORTANT — read before using:
+#   * Using GitHub-hosted runners as remote desktops violates the GitHub
+#     Additional Terms of Service for Actions ("Actions should be used for
+#     software production, not for general-purpose computing / hosting").
+#     GitHub can suspend the account or repository that runs this.
+#   * Windows runners bill at 2x the minute rate on private repositories.
+#     A 6-hour session consumes ~720 billed minutes.
+#   * The machine exists only while the workflow runs (hard cap 6 hours).
+#
+# Required repository secret: NGROK_AUTHTOKEN (https://dashboard.ngrok.com)
+
+name: RDP Machine
+
+on:
+  workflow_dispatch:
+    inputs:
+      ttl_minutes:
+        description: "Machine lifetime in minutes (max 360)"
+        required: false
+        default: "120"
+      grant_admin:
+        description: "Give the RDP user Administrators rights (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  rdp-machine:
+    name: RDP machine (available while this job runs)
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Enable RDP and create the local user
+        shell: pwsh
+        env:
+          GRANT_ADMIN: ${{ inputs.grant_admin }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-RandomString {
+            param([string]$Pool, [int]$Length)
+            $bytes = New-Object byte[] $Length
+            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+            -join ($bytes | ForEach-Object { $Pool[$_ % $Pool.Length] })
+          }
+
+          # Random login + complex password (upper/lower/digit/special).
+          $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+          $lower   = 'abcdefghijkmnpqrstuvwxyz'
+          $digits  = '23456789'
+          $special = '!#$%*+-.?@^~'
+          $username = 'rdp' + (Get-RandomString -Pool $lower -Length 4)
+          $chars = @()
+          $chars += (Get-RandomString -Pool $upper   -Length 2).ToCharArray()
+          $chars += (Get-RandomString -Pool $lower   -Length 8).ToCharArray()
+          $chars += (Get-RandomString -Pool $digits  -Length 3).ToCharArray()
+          $chars += (Get-RandomString -Pool $special -Length 3).ToCharArray()
+          # Fisher-Yates shuffle so the class characters are not predictable.
+          for ($i = $chars.Length - 1; $i -gt 0; $i--) {
+            $j = Get-Random -Maximum ($i + 1)
+            $chars[$i], $chars[$j] = $chars[$j], $chars[$i]
+          }
+          $password = -join $chars
+
+          # --- enable Remote Desktop -----------------------------------
+          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+          Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+          try { Start-Service TermService -ErrorAction SilentlyContinue } catch {}
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes | Out-Null
+
+          # --- create the account --------------------------------------
+          net user $username $password /add /y | Out-Null
+          net localgroup "Remote Desktop Users" $username /add | Out-Null
+          Set-LocalUser -Name $username -PasswordNeverExpires $true
+          if ($env:GRANT_ADMIN -eq 'true') {
+            net localgroup Administrators $username /add | Out-Null
+          }
+
+          # Persist the credentials for the next step (never echoed to the log).
+          "RDP_USERNAME=$username"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD=$password"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Created RDP user '$username' (password hidden). RDP enabled."
+
+      - name: Start the ngrok TCP tunnel
+        shell: pwsh
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+            Write-Host "::error::Repository secret NGROK_AUTHTOKEN is not set. Add it in Settings > Secrets and variables > Actions."
+            exit 1
+          }
+          Invoke-WebRequest `
+            -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' `
+            -OutFile "$env:RUNNER_TEMP\ngrok.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\ngrok.zip" `
+            -DestinationPath "$env:RUNNER_TEMP\ngrok" -Force
+          & "$env:RUNNER_TEMP\ngrok\ngrok.exe" config add-authtoken $env:NGROK_AUTHTOKEN | Out-Null
+          Start-Process -FilePath "$env:RUNNER_TEMP\ngrok\ngrok.exe" `
+            -ArgumentList 'tcp', '3389' -WindowStyle Hidden
+          Write-Host "ngrok tunnel to localhost:3389 started."
+
+      - name: Publish connection info as an artifact
+        shell: pwsh
+        env:
+          TTL_MINUTES: ${{ inputs.ttl_minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Wait until the ngrok local API reports the public tcp endpoint.
+          $endpoint = $null
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+            try {
+              $tunnels = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 5
+              $tunnel = @($tunnels.tunnels | Where-Object {
+                ($_.'public_url' -like 'tcp://*') })[0]
+              if ($tunnel) { $endpoint = $tunnel.'public_url'; break }
+            } catch {}
+          }
+          if (-not $endpoint) {
+            Write-Host "::error::ngrok tunnel did not come up in time."
+            exit 1
+          }
+
+          $parsed = [Uri]$endpoint
+          $lines = @(
+            "host=$($parsed.Host)",
+            "port=$($parsed.Port)",
+            "username=$env:RDP_USERNAME",
+            "password=$env:RDP_PASSWORD",
+            "ttl_minutes=$env:TTL_MINUTES",
+            "machine=$env:COMPUTERNAME"
+          )
+          $lines | Set-Content -Path connection.txt -Encoding ascii
+          Write-Host "RDP ready: $($parsed.Host):$($parsed.Port) (user $env:RDP_USERNAME)."
+
+      - name: Upload connection artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection-${{ github.run_id }}
+          path: connection.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Keep the machine alive until the TTL expires
+        shell: pwsh
+        env:
+          TTL_MINUTES: ${{ inputs.ttl_minutes }}
+        run: |
+          $ttl = 120
+          if (-not [int]::TryParse($env:TTL_MINUTES, [ref]$ttl)) { $ttl = 120 }
+          $ttl = [Math]::Min($ttl, 360)
+          # Leave a margin before the job timeout so the run still concludes
+          # with "success" instead of being killed mid-sleep.
+          $seconds = [Math]::Max($ttl * 60 - 300, 60)
+          Write-Host "RDP machine is ready — holding the session for $ttl minutes."
+          Start-Sleep -Seconds $seconds
+          Write-Host "TTL reached. The machine will now shut down."
