@@ -106,8 +106,12 @@ jobs:
           Expand-Archive -Path "$env:RUNNER_TEMP\ngrok.zip" `
             -DestinationPath "$env:RUNNER_TEMP\ngrok" -Force
           & "$env:RUNNER_TEMP\ngrok\ngrok.exe" config add-authtoken $env:NGROK_AUTHTOKEN | Out-Null
+          # Log to stdout (captured to files) so failures are diagnosable.
           Start-Process -FilePath "$env:RUNNER_TEMP\ngrok\ngrok.exe" `
-            -ArgumentList 'tcp', '3389' -WindowStyle Hidden
+            -ArgumentList 'tcp', '3389', '--log', 'stdout', '--log-format', 'logfmt' `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\ngrok.log" `
+            -RedirectStandardError "$env:RUNNER_TEMP\ngrok.err"
           Write-Host "ngrok tunnel to localhost:3389 started."
 
       - name: Publish connection info as an artifact
@@ -129,6 +133,14 @@ jobs:
             } catch {}
           }
           if (-not $endpoint) {
+            # Surface ngrok's own log so the real cause (bad authtoken,
+            # account limits, ...) is visible in the job log.
+            foreach ($logFile in @("$env:RUNNER_TEMP\ngrok.log", "$env:RUNNER_TEMP\ngrok.err")) {
+              if (Test-Path $logFile) {
+                Write-Host "--- ngrok log: $logFile (last 40 lines) ---"
+                Get-Content $logFile -Tail 40 | ForEach-Object { Write-Host $_ }
+              }
+            }
             Write-Host "::error::ngrok tunnel did not come up in time."
             exit 1
           }
