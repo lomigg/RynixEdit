@@ -24,7 +24,7 @@ on:
       username:
         description: "Windows username for the RDP session"
         required: false
-        default: "runneradmin"
+        default: "rdpadmin"
 
 permissions:
   contents: read
@@ -59,20 +59,34 @@ jobs:
         env:
           RDP_USERNAME_INPUT: ${{ inputs.username }}
         run: |
-          $username = if ($env:RDP_USERNAME_INPUT) { $env:RDP_USERNAME_INPUT } else { 'runneradmin' }
+          # NB: avoid 'runneradmin' — the GitHub runner image ships that
+          # account and its password policy blocks a plain reset.
+          $username = if ($env:RDP_USERNAME_INPUT) { $env:RDP_USERNAME_INPUT } else { 'rdpadmin' }
 
-          # 16 chars from an unambiguous alphabet — satisfies Windows password
-          # complexity rules and avoids look-alikes (l/I/1, O/0).
-          $alphabet = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789'
-          $bytes = New-Object byte[] 16
+          function Get-RandomString {
+            param([string]$Pool, [int]$Length)
+            $bytes = New-Object byte[] $Length
+            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+            -join ($bytes | ForEach-Object { $Pool[$_ % $Pool.Length] })
+          }
+
+          # Complex by construction (upper+lower+digit+special), then shuffled
+          # so the character classes are not position-predictable.
+          $chars = @()
+          $chars += (Get-RandomString -Pool 'ABCDEFGHJKLMNPQRSTUVWXYZ'  -Length 2).ToCharArray()
+          $chars += (Get-RandomString -Pool 'abcdefghijkmnpqrstuvwxyz' -Length 10).ToCharArray()
+          $chars += (Get-RandomString -Pool '23456789'                 -Length 3).ToCharArray()
+          $chars += (Get-RandomString -Pool '!#$%*+-.?@^~'             -Length 1).ToCharArray()
           $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-          $rng.GetBytes($bytes)
-          $password = -join ($bytes | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
+          for ($i = $chars.Length - 1; $i -gt 0; $i--) {
+            $j = $rng.Next($i + 1)
+            $chars[$i], $chars[$j] = $chars[$j], $chars[$i]
+          }
+          $password = -join $chars
 
           net user $username $password /add /y
           if ($LASTEXITCODE -ne 0) {
-            # GitHub runner images ship with 'runneradmin' — reset its
-            # password instead of failing.
+            # If the account already exists, reset its password instead.
             net user $username $password /y
             if ($LASTEXITCODE -ne 0) {
               Write-Host "::error::Failed to create or update the Windows user."
