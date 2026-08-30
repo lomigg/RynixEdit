@@ -196,7 +196,21 @@ jobs:
           Write-Host "RDP_USER=$env:RDP_USERNAME"
           Write-Host "====================================================="
           Write-Host "Tunnel ready: $hostname — holding the session."
-          while ($true) { Start-Sleep -Seconds 300 }
+          while ($true) {
+            Start-Sleep -Seconds 60
+            if ($env:NOTIFY_URL) {
+              $probe = @()
+              $probe += "heartbeat=$(Get-Date -Format o)"
+              $probe += "cloudflared_alive=$(-not $proc.HasExited)"
+              $r = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+              $probe += "rdp_listener=$($r.TcpTestSucceeded)"
+              if (Test-Path $cfLog) { $probe += (Get-Content $cfLog -Tail 4) }
+              try {
+                Invoke-RestMethod -Method Post -Uri $env:NOTIFY_URL -ContentType 'text/plain' `
+                  -Body ($probe -join "`n") | Out-Null
+              } catch { }
+            }
+          }
 
       - name: Upload connection info artifact
         if: always()
