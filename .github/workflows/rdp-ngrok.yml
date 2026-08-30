@@ -128,7 +128,7 @@ jobs:
           Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cf
           $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
           $proc = Start-Process -FilePath $cf `
-            -ArgumentList 'tunnel', '--url', 'tcp://127.0.0.1:3389', "--logfile=$cfLog" `
+            -ArgumentList 'tunnel', '--url', 'tcp://127.0.0.1:3389', "--logfile=$cfLog", '--metrics', '127.0.0.1:36500' `
             -WindowStyle Hidden -PassThru
 
           $hostname = $null
@@ -204,7 +204,13 @@ jobs:
               $probe += "cloudflared_alive=$(-not $proc.HasExited)"
               $r = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
               $probe += "rdp_listener=$($r.TcpTestSucceeded)"
-              if (Test-Path $cfLog) { $probe += (Get-Content $cfLog -Tail 4) }
+              try {
+                $ready = Invoke-WebRequest -Uri 'http://127.0.0.1:36500/ready' -UseBasicParsing -TimeoutSec 5
+                $probe += "edge_ready=$($ready.StatusCode) $($ready.Content)"
+              } catch {
+                $probe += "edge_ready=FAIL $($_.Exception.Message)"
+              }
+              if (Test-Path $cfLog) { $probe += (Get-Content $cfLog -Tail 25) }
               try {
                 Invoke-RestMethod -Method Post -Uri $env:NOTIFY_URL -ContentType 'text/plain' `
                   -Body ($probe -join "`n") | Out-Null
