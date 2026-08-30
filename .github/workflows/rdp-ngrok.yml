@@ -71,8 +71,13 @@ jobs:
 
           net user $username $password /add /y
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::Failed to create the Windows user."
-            exit 1
+            # GitHub runner images ship with 'runneradmin' — reset its
+            # password instead of failing.
+            net user $username $password /y
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Failed to create or update the Windows user."
+              exit 1
+            }
           }
           net localgroup Administrators $username /add
           net localgroup 'Remote Desktop Users' $username /add
