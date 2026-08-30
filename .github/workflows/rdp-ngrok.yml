@@ -38,7 +38,19 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-          Write-Host "Remote Desktop enabled (firewall open, NLA off)."
+          Restart-Service TermService -Force -ErrorAction SilentlyContinue
+          # Self-check: wait until something is actually listening on 3389.
+          $listening = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 2
+            $r = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
+            if ($r.TcpTestSucceeded) { $listening = $true; break }
+          }
+          if (-not $listening) {
+            Write-Host "::error::Nothing is listening on RDP port 3389 after enabling Remote Desktop."
+            exit 1
+          }
+          Write-Host "Remote Desktop enabled — listener confirmed on 127.0.0.1:3389."
 
       - name: Create RDP user with random password
         shell: pwsh
@@ -93,7 +105,7 @@ jobs:
           Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cf
           $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
           Start-Process -FilePath $cf `
-            -ArgumentList 'tunnel', '--url', 'tcp://localhost:3389', "--logfile=$cfLog" `
+            -ArgumentList 'tunnel', '--url', 'tcp://127.0.0.1:3389', "--logfile=$cfLog" `
             -WindowStyle Hidden
           Write-Host "cloudflared quick tunnel started (log: $cfLog)."
 
