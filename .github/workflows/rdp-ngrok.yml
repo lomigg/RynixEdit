@@ -98,24 +98,24 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
           Write-Host "User $username created (password withheld from logs)."
 
-      - name: Start Cloudflare quick tunnel
+      - name: Start tunnel, publish info, keep alive
         shell: pwsh
         run: |
+          # The tunnel MUST live inside this final step: GitHub's Windows
+          # runner kills step-spawned background processes when the step
+          # ends, so a tunnel started in an earlier step is dead by the
+          # time anyone tries to connect.
           $cf = Join-Path $env:RUNNER_TEMP 'cloudflared.exe'
           Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cf
           $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
-          Start-Process -FilePath $cf `
+          $proc = Start-Process -FilePath $cf `
             -ArgumentList 'tunnel', '--url', 'tcp://127.0.0.1:3389', "--logfile=$cfLog" `
-            -WindowStyle Hidden
-          Write-Host "cloudflared quick tunnel started (log: $cfLog)."
+            -WindowStyle Hidden -PassThru
 
-      - name: Publish connection info
-        shell: pwsh
-        run: |
-          $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
           $hostname = $null
-          for ($i = 0; $i -lt 45; $i++) {
+          for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
+            if ($proc.HasExited) { break }
             if (Test-Path $cfLog) {
               $match = Select-String -Path $cfLog -Pattern 'https://([a-z0-9-]+\.trycloudflare\.com)' |
                 Select-Object -First 1
@@ -126,31 +126,31 @@ jobs:
             Write-Host "=== cloudflared log (last 40 lines) ==="
             if (Test-Path $cfLog) {
               Get-Content $cfLog -Tail 40 | ForEach-Object { Write-Host $_ }
-            } else {
-              Write-Host "(cloudflared.log not found — process likely exited immediately)"
             }
-            Write-Host "::error::Could not read the cloudflared tunnel hostname."
+            Write-Host "::error::Could not obtain the quick-tunnel hostname."
             exit 1
           }
 
-          Write-Host "Tunnel ready: $hostname"
           Set-Content -Path 'rdp-info.txt' -Value @(
             "Address:  $hostname",
-            "Tunnel:   cloudflare-quick (client runs: cloudflared access tcp)",
+            "Tunnel:   cloudflare-quick (client: cloudflared access tcp)",
             "Username: $env:RDP_USERNAME",
             "Password: $env:RDP_PASSWORD"
           )
+          Write-Host ""
+          Write-Host "================ RDP CONNECTION INFO ================"
+          Write-Host "TUNNEL_HOSTNAME=$hostname"
+          Write-Host "RDP_USER=$env:RDP_USERNAME"
+          Write-Host "RDP_PASSWORD=$env:RDP_PASSWORD"
+          Write-Host "====================================================="
+          Write-Host "Tunnel ready: $hostname — holding the session."
+          while ($true) { Start-Sleep -Seconds 300 }
 
       - name: Upload connection info artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rdp-info-${{ github.run_id }}
           path: rdp-info.txt
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 1
-
-      - name: Keep the machine alive
-        shell: pwsh
-        run: |
-          Write-Host "RDP machine ready — it lives until the run is cancelled or the 6-hour hosted-runner cap is hit."
-          while ($true) { Start-Sleep -Seconds 300 }
