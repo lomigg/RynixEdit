@@ -3,18 +3,14 @@
 # Windows RDP machine with /rdp create. The workflow:
 #   1. enables Remote Desktop on the runner,
 #   2. creates a local administrator with a random password,
-#   3. opens an ngrok TCP tunnel to port 3389,
+#   3. opens a Cloudflare quick tunnel (trycloudflare.com — no account, no
+#      secret needed) to port 3389,
 #   4. publishes Address/Username/Password as the rdp-info-<run_id> artifact
 #      (the Discord bot reads this artifact and DMs it to the requester),
 #   5. keeps the machine alive until the run is cancelled or GitHub's
 #      6-hour hosted-runner cap ends the job.
-#
-# Required repository secret: NGROK_AUTHTOKEN (https://dashboard.ngrok.com
-# -> Your Authtoken), added under Settings > Secrets and variables > Actions.
-#
-# WARNING: GitHub Actions terms only cover project build/test workloads.
-# Using hosted runners as personal remote desktops can get the account
-# suspended — use your own token, at your own risk.
+#   Client side: run "cloudflared access tcp --hostname <address> --url
+#   localhost:13389" then RDP to localhost:13389 (cloudflared.exe is free).
 
 name: Windows RDP Machine
 
@@ -36,16 +32,6 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Check ngrok authtoken secret
-        shell: pwsh
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
-            Write-Host "::error::Secret NGROK_AUTHTOKEN is missing. Add it under Settings > Secrets and variables > Actions."
-            exit 1
-          }
-
       - name: Enable Remote Desktop
         shell: pwsh
         run: |
@@ -100,56 +86,45 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
           Write-Host "User $username created (password withheld from logs)."
 
-      - name: Start ngrok TCP tunnel
+      - name: Start Cloudflare quick tunnel
         shell: pwsh
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'ngrok.zip'
-          Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ngrok') -Force
-          $ngrok = Join-Path (Join-Path $env:RUNNER_TEMP 'ngrok') 'ngrok.exe'
-          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::ngrok rejected the authtoken."
-            exit 1
-          }
-          $ngrokLog = Join-Path $env:RUNNER_TEMP 'ngrok.log'
-          Start-Process -FilePath $ngrok `
-            -ArgumentList 'tcp', '3389', "--log=$ngrokLog", '--log-format=logfmt' `
+          $cf = Join-Path $env:RUNNER_TEMP 'cloudflared.exe'
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cf
+          $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
+          Start-Process -FilePath $cf `
+            -ArgumentList 'tunnel', '--url', 'tcp://localhost:3389', "--log=$cfLog" `
             -WindowStyle Hidden
-          Write-Host "ngrok TCP tunnel to port 3389 started (log: $ngrokLog)."
+          Write-Host "cloudflared quick tunnel started (log: $cfLog)."
 
       - name: Publish connection info
         shell: pwsh
         run: |
-          $ngrokLog = Join-Path $env:RUNNER_TEMP 'ngrok.log'
-          $address = $null
+          $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
+          $hostname = $null
           for ($i = 0; $i -lt 45; $i++) {
             Start-Sleep -Seconds 2
-            try {
-              $tunnels = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 5
-              $tunnel = $tunnels.tunnels | Where-Object { $_.proto -eq 'tcp' } | Select-Object -First 1
-              if ($tunnel) {
-                $address = $tunnel.public_url -replace '^tcp://', ''
-                break
-              }
-            } catch { }
-          }
-          if (-not $address) {
-            Write-Host "=== ngrok log (last 50 lines) ==="
-            if (Test-Path $ngrokLog) {
-              Get-Content $ngrokLog -Tail 50 | ForEach-Object { Write-Host $_ }
-            } else {
-              Write-Host "(ngrok.log not found — agent likely exited immediately)"
+            if (Test-Path $cfLog) {
+              $match = Select-String -Path $cfLog -Pattern 'https://([a-z0-9-]+\.trycloudflare\.com)' |
+                Select-Object -First 1
+              if ($match) { $hostname = $match.Matches[0].Groups[1].Value; break }
             }
-            Write-Host "::error::Could not read the ngrok tunnel address."
+          }
+          if (-not $hostname) {
+            Write-Host "=== cloudflared log (last 40 lines) ==="
+            if (Test-Path $cfLog) {
+              Get-Content $cfLog -Tail 40 | ForEach-Object { Write-Host $_ }
+            } else {
+              Write-Host "(cloudflared.log not found — process likely exited immediately)"
+            }
+            Write-Host "::error::Could not read the cloudflared tunnel hostname."
             exit 1
           }
 
-          Write-Host "Tunnel ready: $address"
+          Write-Host "Tunnel ready: $hostname"
           Set-Content -Path 'rdp-info.txt' -Value @(
-            "Address:  $address",
+            "Address:  $hostname",
+            "Tunnel:   cloudflare-quick (client runs: cloudflared access tcp)",
             "Username: $env:RDP_USERNAME",
             "Password: $env:RDP_PASSWORD"
           )
