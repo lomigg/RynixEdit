@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 jobs:
   rdp:
@@ -97,6 +98,18 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_USERNAME=$username"
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
           Write-Host "User $username created (password withheld from logs)."
+          Set-Content -Path 'rdp-creds.txt' -Value @(
+            "Username: $username",
+            "Password: $password"
+          )
+
+      - name: Upload credentials artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-creds-${{ github.run_id }}
+          path: rdp-creds.txt
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Start tunnel, publish info, keep alive
         shell: pwsh
@@ -137,11 +150,32 @@ jobs:
             "Username: $env:RDP_USERNAME",
             "Password: $env:RDP_PASSWORD"
           )
+
+          # Publish the hostname as a commit status so the bot (and anyone
+          # with API access) can read it while this run is still in progress.
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept        = 'application/vnd.github+json'
+            'User-Agent'  = 'rdp-machine'
+          }
+          $body = @{
+            state       = 'success'
+            context     = 'rdp-machine'
+            description = "Tunnel: $hostname | User: $env:RDP_USERNAME"
+          } | ConvertTo-Json
+          try {
+            Invoke-RestMethod `
+              -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" `
+              -Method Post -Headers $headers -Body $body -ContentType 'application/json' | Out-Null
+            Write-Host "Commit status published."
+          } catch {
+            Write-Host "::warning::Could not publish the commit status: $_"
+          }
+
           Write-Host ""
           Write-Host "================ RDP CONNECTION INFO ================"
           Write-Host "TUNNEL_HOSTNAME=$hostname"
           Write-Host "RDP_USER=$env:RDP_USERNAME"
-          Write-Host "RDP_PASSWORD=$env:RDP_PASSWORD"
           Write-Host "====================================================="
           Write-Host "Tunnel ready: $hostname — holding the session."
           while ($true) { Start-Sleep -Seconds 300 }
