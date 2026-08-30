@@ -141,7 +141,7 @@ jobs:
           $pinggyOut = Join-Path $env:RUNNER_TEMP 'pinggy.out'
           $pinggyErr = Join-Path $env:RUNNER_TEMP 'pinggy.err'
           $proc = Start-Process -FilePath $sshExe `
-            -ArgumentList '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=30', `
+            -ArgumentList '-n', '-T', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=30', `
               '-p', '443', '-R0:localhost:3389', 'tcp@free.pinggy.io' `
             -RedirectStandardOutput $pinggyOut -RedirectStandardError $pinggyErr `
             -WindowStyle Hidden -PassThru
