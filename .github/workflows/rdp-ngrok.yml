@@ -3,17 +3,17 @@
 # Windows RDP machine with /rdp create. The workflow:
 #   1. enables Remote Desktop on the runner,
 #   2. creates a local administrator with a random password,
-#   3. opens a free pinggy.io TCP tunnel to port 3389 in the FINAL step
-#      (GitHub's Windows runner kills step-spawned background processes
-#      when the step ends, so the tunnel must own the last step),
-#   4. uploads Address/Username/Password as the rdp-creds-<run_id> /
-#      rdp-info-<run_id> artifacts (readable while the run is in progress)
-#      and optionally POSTs the address to the notify_url webhook input,
+#   3. opens a Cloudflare quick tunnel with --protocol http2 in the FINAL
+#      step (GitHub's Windows runner kills step-spawned background
+#      processes when the step ends, so the tunnel must own the last step;
+#      http2 avoids UDP/QUIC being dropped by datacenter firewalls),
+#   4. uploads Username/Password as the rdp-creds-<run_id> artifact
+#      (readable while the run is in progress) and POSTs the tunnel
+#      hostname to the notify_url webhook input,
 #   5. keeps the machine alive until the run is cancelled or GitHub's
 #      6-hour hosted-runner cap ends the job.
-#
-# NOTE: pinggy free tunnels expire after 60 minutes — create a new machine
-# with /rdp create when that happens. No repository secrets are required.
+#   Client side: run "cloudflared access tcp --hostname <address> --url
+#   localhost:13389" then RDP to localhost:13389 (cloudflared.exe is free).
 #
 # WARNING: GitHub Actions terms only cover project build/test workloads.
 # Using hosted runners as personal remote desktops can get the account
@@ -29,7 +29,7 @@ on:
         required: false
         default: "rdpadmin"
       notify_url:
-        description: "Optional webhook URL to POST the tunnel address to"
+        description: "Optional webhook URL to POST the tunnel hostname to"
         required: false
         default: ""
 
@@ -121,7 +121,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Start pinggy tunnel, publish info, keep alive
+      - name: Start tunnel, publish info, keep alive
         shell: pwsh
         env:
           NOTIFY_URL: ${{ inputs.notify_url }}
@@ -130,59 +130,45 @@ jobs:
           # runner kills step-spawned background processes when the step
           # ends, so a tunnel started in an earlier step is dead by the
           # time anyone tries to connect.
-          $sshExe = Join-Path $env:WINDIR 'System32\OpenSSH\ssh.exe'
-          if (-not (Test-Path $sshExe)) {
-            $sshExe = Join-Path $env:ProgramFiles 'Git\usr\bin\ssh.exe'
-          }
-          if (-not (Test-Path $sshExe)) {
-            Write-Host "::error::ssh.exe not found on the runner."
-            exit 1
-          }
-          $pinggyOut = Join-Path $env:RUNNER_TEMP 'pinggy.out'
-          $pinggyErr = Join-Path $env:RUNNER_TEMP 'pinggy.err'
-          $proc = Start-Process -FilePath $sshExe `
-            -ArgumentList '-n', '-T', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=30', `
-              '-p', '443', '-R0:localhost:3389', 'tcp@free.pinggy.io' `
-            -RedirectStandardOutput $pinggyOut -RedirectStandardError $pinggyErr `
+          $cf = Join-Path $env:RUNNER_TEMP 'cloudflared.exe'
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $cf
+          $cfLog = Join-Path $env:RUNNER_TEMP 'cloudflared.log'
+          $proc = Start-Process -FilePath $cf `
+            -ArgumentList 'tunnel', '--url', 'tcp://127.0.0.1:3389', "--logfile=$cfLog", '--protocol', 'http2' `
             -WindowStyle Hidden -PassThru
 
-          $address = $null
+          $hostname = $null
           for ($i = 0; $i -lt 60; $i++) {
             Start-Sleep -Seconds 2
             if ($proc.HasExited) { break }
-            foreach ($logFile in @($pinggyOut, $pinggyErr)) {
-              if ((Test-Path $logFile) -and -not $address) {
-                $match = Select-String -Path $logFile -Pattern 'tcp://([a-z0-9.-]+):(\d+)' |
-                  Select-Object -First 1
-                if ($match) {
-                  $address = $match.Matches[0].Groups[1].Value + ':' + $match.Matches[0].Groups[2].Value
-                }
-              }
+            if (Test-Path $cfLog) {
+              $match = Select-String -Path $cfLog -Pattern 'https://([a-z0-9-]+\.trycloudflare\.com)' |
+                Select-Object -First 1
+              if ($match) { $hostname = $match.Matches[0].Groups[1].Value; break }
             }
-            if ($address) { break }
           }
-          if (-not $address) {
-            Write-Host "=== pinggy stdout ==="
-            if (Test-Path $pinggyOut) { Get-Content $pinggyOut | ForEach-Object { Write-Host $_ } }
-            Write-Host "=== pinggy stderr ==="
-            if (Test-Path $pinggyErr) { Get-Content $pinggyErr | ForEach-Object { Write-Host $_ } }
-            Write-Host "::error::Could not obtain the pinggy tunnel address."
+          if (-not $hostname) {
+            Write-Host "=== cloudflared log (last 40 lines) ==="
+            if (Test-Path $cfLog) {
+              Get-Content $cfLog -Tail 40 | ForEach-Object { Write-Host $_ }
+            }
+            Write-Host "::error::Could not obtain the quick-tunnel hostname."
             exit 1
           }
 
           Set-Content -Path 'rdp-info.txt' -Value @(
-            "Address:  $address",
-            "Tunnel:   pinggy-free (direct TCP, no client needed; 60 min limit)",
+            "Address:  $hostname",
+            "Tunnel:   cloudflare-quick (client: cloudflared access tcp)",
             "Username: $env:RDP_USERNAME",
             "Password: $env:RDP_PASSWORD"
           )
 
-          # Channel that needs no GitHub permissions: POST the address to the
-          # caller-provided webhook (no secrets in the body).
+          # Channel that needs no GitHub permissions: POST the hostname to
+          # the caller-provided webhook (no secrets in the body).
           if ($env:NOTIFY_URL) {
             try {
               Invoke-RestMethod -Method Post -Uri $env:NOTIFY_URL -ContentType 'text/plain' `
-                -Body "rdp-machine`nhost=$address`nuser=$env:RDP_USERNAME" | Out-Null
+                -Body "rdp-machine`nhost=$hostname`nuser=$env:RDP_USERNAME" | Out-Null
               Write-Host "Notify webhook called."
             } catch {
               Write-Host "::warning::Notify webhook failed: $_"
@@ -191,16 +177,16 @@ jobs:
 
           Write-Host ""
           Write-Host "================ RDP CONNECTION INFO ================"
-          Write-Host "TUNNEL_ADDRESS=$address"
+          Write-Host "TUNNEL_HOSTNAME=$hostname"
           Write-Host "RDP_USER=$env:RDP_USERNAME"
           Write-Host "====================================================="
-          Write-Host "Tunnel ready: $address — holding the session."
+          Write-Host "Tunnel ready: $hostname — holding the session."
           while ($true) {
             Start-Sleep -Seconds 60
             if ($env:NOTIFY_URL) {
               $probe = @()
               $probe += "heartbeat=$(Get-Date -Format o)"
-              $probe += "pinggy_alive=$(-not $proc.HasExited)"
+              $probe += "cloudflared_alive=$(-not $proc.HasExited)"
               $r = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
               $probe += "rdp_listener=$($r.TcpTestSucceeded)"
               try {
