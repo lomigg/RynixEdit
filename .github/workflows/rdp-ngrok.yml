@@ -196,6 +196,7 @@ jobs:
           Write-Host "RDP_USER=$env:RDP_USERNAME"
           Write-Host "====================================================="
           Write-Host "Tunnel ready: $hostname — holding the session."
+          $selfTestDone = $false
           while ($true) {
             Start-Sleep -Seconds 60
             if ($env:NOTIFY_URL) {
@@ -204,6 +205,37 @@ jobs:
               $probe += "cloudflared_alive=$(-not $proc.HasExited)"
               $r = Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue
               $probe += "rdp_listener=$($r.TcpTestSucceeded)"
+              if (-not $selfTestDone -and $hostname) {
+                # Decisive self-test: loop through the edge from this same
+                # runner (client -> edge -> replica -> origin 3389).
+                try {
+                  $accessProc = Start-Process -FilePath $cf `
+                  -ArgumentList 'access', 'tcp', '--hostname', $hostname, '--url', 'localhost:13400', '--logfile', (Join-Path $env:RUNNER_TEMP 'selftest-access.log') `
+                  -WindowStyle Hidden -PassThru
+                Start-Sleep -Seconds 10
+                try {
+                  $tcp = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 13400)
+                  $stream = $tcp.GetStream()
+                  $cr = New-Object System.Collections.Generic.List[byte]
+                  $cr.AddRange([byte[]](3,0,0,43,42,224,0,0,0,0,0))
+                  $cr.AddRange([System.Text.Encoding]::ASCII.GetBytes("Cookie: mstshash=selftest`r`n"))
+                  $cr.AddRange([byte[]](1,0,8,0,0,0,0,0))
+                  $stream.Write($cr.ToArray(), 0, $cr.Count)
+                  $stream.ReadTimeout = 15000
+                  $buf = New-Object byte[] 64
+                  try {
+                    $n = $stream.Read($buf, 0, 64)
+                    $probe += "selftest=RECV $n bytes: $([BitConverter]::ToString($buf, 0, [Math]::Min($n, 20)))"
+                  } catch {
+                    $probe += "selftest=READ_FAIL $($_.Exception.Message)"
+                  }
+                  $tcp.Close()
+                } catch {
+                  $probe += "selftest=CONNECT_FAIL $($_.Exception.Message)"
+                }
+                try { $accessProc.Kill() } catch { }
+                $selfTestDone = $true
+              }
               try {
                 $ready = Invoke-WebRequest -Uri 'http://127.0.0.1:36500/ready' -UseBasicParsing -TimeoutSec 5
                 $probe += "edge_ready=$($ready.StatusCode) $($ready.Content)"
