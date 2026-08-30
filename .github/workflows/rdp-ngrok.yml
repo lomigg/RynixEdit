@@ -96,13 +96,21 @@ jobs:
           Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ngrok') -Force
           $ngrok = Join-Path (Join-Path $env:RUNNER_TEMP 'ngrok') 'ngrok.exe'
-          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN | Out-Null
-          Start-Process -FilePath $ngrok -ArgumentList 'tcp', '3389' -WindowStyle Hidden
-          Write-Host "ngrok TCP tunnel to port 3389 started."
+          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::ngrok rejected the authtoken."
+            exit 1
+          }
+          $ngrokLog = Join-Path $env:RUNNER_TEMP 'ngrok.log'
+          Start-Process -FilePath $ngrok `
+            -ArgumentList 'tcp', '3389', "--log=$ngrokLog", '--log-format=logfmt' `
+            -WindowStyle Hidden
+          Write-Host "ngrok TCP tunnel to port 3389 started (log: $ngrokLog)."
 
       - name: Publish connection info
         shell: pwsh
         run: |
+          $ngrokLog = Join-Path $env:RUNNER_TEMP 'ngrok.log'
           $address = $null
           for ($i = 0; $i -lt 45; $i++) {
             Start-Sleep -Seconds 2
@@ -116,6 +124,12 @@ jobs:
             } catch { }
           }
           if (-not $address) {
+            Write-Host "=== ngrok log (last 50 lines) ==="
+            if (Test-Path $ngrokLog) {
+              Get-Content $ngrokLog -Tail 50 | ForEach-Object { Write-Host $_ }
+            } else {
+              Write-Host "(ngrok.log not found — agent likely exited immediately)"
+            }
             Write-Host "::error::Could not read the ngrok tunnel address."
             exit 1
           }
