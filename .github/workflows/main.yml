@@ -1,10 +1,10 @@
-name: RDP
+name: RynixCloud
 on:
   workflow_dispatch:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
     steps:
       - name: Configure Core RDP Settings
         run: |
@@ -86,15 +86,29 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
+      - name: Save RDP Credentials to File
+        run: |
+          $password = ($env:RDP_CREDS -split 'Password:\s*')[-1]
+          @"
+          Address: $env:TAILSCALE_IP
+          Username: RDP
+          Password: $password
+          "@ | Out-File -FilePath "$env:RUNNER_TEMP\creds.txt" -Encoding ascii
+          Write-Host "Credential file prepared (contents are never printed)."
+
+      - name: Upload RDP Credentials
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-creds-${{ github.run_id }}
+          path: ${{ runner.temp }}/creds.txt
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          # Keep runner active indefinitely (or until manually cancelled)
+          Write-Host "RDP session is active. Credentials are delivered privately."
+          # Keep runner active until the session is cancelled or times out
           while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+            Write-Host "[$(Get-Date)] RDP Active"
             Start-Sleep -Seconds 300
           }
