@@ -1,6 +1,8 @@
 name: RynixCloud
 on:
   workflow_dispatch:
+env:
+  WIN_USER: RynixCloud
 jobs:
   secure-rdp:
     runs-on: windows-latest
@@ -35,6 +37,83 @@ jobs:
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "$env:WIN_USER" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "$env:WIN_USER"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "$env:WIN_USER"
+          echo "RDP_CREDS=User: $env:WIN_USER | Password: $password" >> $env:GITHUB_ENV
+          if (-not (Get-LocalUser -Name "$env:WIN_USER")) {
+            Write-Error "User creation failed"
+            exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+          if (-not $tsIP) {
+            Write-Error "Tailscale IP not assigned. Exiting."
+            exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 failed"
+            exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Save RDP Credentials to File
+        run: |
+          $password = ($env:RDP_CREDS -split 'Password:\s*')[-1]
+          @"
+          Address: $env:TAILSCALE_IP
+          Username: $env:WIN_USER
+          Password: $password
+          "@ | Out-File -FilePath "$env:RUNNER_TEMP\creds.txt" -Encoding ascii
+          Write-Host "Credential file prepared (contents are never printed)."
+
+      - name: Upload RDP Credentials
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-creds-${{ github.run_id }}
+          path: ${{ runner.temp }}/creds.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "RDP session is active. Credentials are delivered privately."
+          # Keep runner active until the session is cancelled or times out
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active"
+            Start-Sleep -Seconds 300
+          }          $rawPassword += $charSet.Upper   | Get-Random -Count 4
           $rawPassword += $charSet.Lower   | Get-Random -Count 4
           $rawPassword += $charSet.Number  | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
